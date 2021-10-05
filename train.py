@@ -90,16 +90,17 @@ if __name__ == "__main__":
     demands = jnp.zeros((cfg.batch_size, cfg.num_nodes))
     x = (coords, demands)
     e = jnp.zeros((cfg.batch_size, cfg.num_nodes, model.embed_dim))
-    d = jnp.zeros((cfg.batch_size, model.embed_dim + 1))
+    n = jnp.zeros(cfg.batch_size, dtype=jnp.int32)
+    c = jnp.zeros(cfg.batch_size)
     m = jnp.zeros((cfg.batch_size, cfg.num_nodes, 1), dtype=np.bool)
 
     # Init weights.
     encoder_state, encoder_params = model.init(rng, x, method=model.encode).pop(
         "params"
     )
-    decoder_state, decoder_params = model.init(rng, e, d, m, method=model.decode).pop(
-        "params"
-    )
+    decoder_state, decoder_params = model.init(
+        rng, e, n, c, m, method=model.decode
+    ).pop("params")
 
     states = (encoder_state, decoder_state)
     params = (encoder_params, decoder_params)
@@ -135,7 +136,9 @@ if __name__ == "__main__":
     @jax.jit
     def reinforce_with_rollout_loss(params, baseline_params, rng, problems):
         costs, log_probs = apply_fn(states, params, rng, problems)
-        baseline, _ = apply_fn(states, baseline_params, rng, problems, deterministic=True)
+        baseline, _ = apply_fn(
+            states, baseline_params, rng, problems, deterministic=True
+        )
         loss = jnp.mean((costs - baseline) * log_probs)
         return loss, jnp.mean(costs)
 
@@ -181,7 +184,9 @@ if __name__ == "__main__":
                 loss_fn = reinforce_with_rollout_loss
 
             grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-            (loss, costs), grads = grad_fn(training_state.params, baseline_params, step_rng, inputs)
+            (loss, costs), grads = grad_fn(
+                training_state.params, baseline_params, step_rng, inputs
+            )
             training_state = training_state.apply_gradients(grads=grads)
 
             pbar.set_postfix(loss=loss, costs=costs)

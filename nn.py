@@ -83,26 +83,40 @@ class PointerDecoder(nn.Module):
     clip: float = 10.0
 
     def setup(self):
-        self.Wq_fixed = nn.Dense(self.embed_dim, use_bias=False)
-        self.Wq_step = nn.Dense(self.embed_dim, use_bias=False)
-        self.Wk = nn.Dense(self.embed_dim, use_bias=False)
+        self.encode_state = nn.Dense(self.embed_dim)
+        self.encode_graph = nn.Dense(self.embed_dim)
+        self.encode_capacity = nn.Dense(self.embed_dim)
+
+        self.Wk = nn.Dense(self.embed_dim)
+        self.Wq = nn.Dense(self.embed_dim)
+
         self.mha = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.embed_dim,
             out_features=self.embed_dim,
         )
 
-    def __call__(self, node_embeddings, step_context, mask, training=True):
+    def __call__(self, node_embeddings, state_nodes, capacities, mask, training=True):
+        bs = node_embeddings.shape[0]
 
-        Q_step = self.Wq_step(step_context)
-        Q_fixed = self.Wq_fixed(jnp.sum(node_embeddings, axis=1)[:, None])
+        # This part is a little different than the original paper. Instead of concatenating
+        # then projecting, we project first, and then add instead of concatenate.
+        # This is a more BERTasque approach to create the embedding.
+        state_node_embedding = self.encode_state(
+            node_embeddings[jnp.arange(bs), state_nodes]
+        )
+        graph_embedding = self.encode_graph(jnp.sum(node_embeddings, axis=1))
+        capacity_embedding = self.encode_capacity(capacities[:, None])
 
-        Q1 = Q_fixed + Q_step
+        Q1 = (state_node_embedding + graph_embedding + capacity_embedding)[:, None]
+
         Q2 = self.mha(
             Q1,
             node_embeddings,
             mask=jnp.transpose(mask[:, None], (0, 1, 3, 2)),
         )
+
+        Q2 = self.Wq(Q2)
         K2 = self.Wk(node_embeddings)
 
         logits = jnp.einsum("...qd, ...kd -> ...qk", Q2, K2) / jnp.sqrt(self.embed_dim)
@@ -118,10 +132,10 @@ class PointerDecoder(nn.Module):
 
 
 class AttentionModel(nn.Module):
-    embed_dim: int = 256
+    embed_dim: int = 128
     num_heads: int = 8
     num_layers: int = 3
-    ff_dim: int = 1024
+    ff_dim: int = 512
     clip: float = 10.0
 
     def setup(self):
@@ -140,8 +154,10 @@ class AttentionModel(nn.Module):
     def encode(self, x, training=True):
         return self.encoder(x, training=training)
 
-    def decode(self, x, node_embeddings, mask=None, training=True):
-        return self.decoder(x, node_embeddings, mask=mask, training=training)
+    def decode(self, node_embeddings, state_nodes, capacities, mask, training=True):
+        return self.decoder(
+            node_embeddings, state_nodes, capacities, mask, training=training
+        )
 
 
 @partial(jax.jit, static_argnums=(0,), static_argnames=("deterministic", "training"))
@@ -177,14 +193,14 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
     # followed by a depot visit.
     sequences = jnp.zeros((bs, 2 * seq_len), dtype=jnp.int32)
 
-    step_context = jnp.concatenate(
-        [node_embeddings[:, 0, None], capacities[:, None, None]], axis=-1
-    )
+    # step_context = jnp.concatenate(
+    #     [node_embeddings[:, 0], capacities[:, None]], axis=-1
+    # )
 
     log_probs = jnp.zeros(bs)
 
     def decode_iteration(idx, loop_state):
-        (rng, sequences, visited, capacities, step_context, log_probs) = loop_state
+        (rng, sequences, visited, capacities, log_probs) = loop_state
 
         current_node = sequences[:, idx - 1]
 
@@ -201,7 +217,6 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
 
         # We always allow the vehicle to move or stay in a depot if all
         # customers have been visited.
-        # FIXME: Zero as depot is hardcoded here.
         next_node_mask = next_node_mask.at[:, 0].set(
             ~(visited | ~customer_mask).all(axis=-1) & next_node_mask[:, 0],
         )
@@ -211,7 +226,9 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
         logits, decoder_state = net.apply(
             decoder_variables,
             node_embeddings,
-            step_context,
+            current_node,
+            capacities,
+            # step_context,
             next_node_mask[:, :, None],
             mutable=decoder_state.keys(),
             method=net.decode,
@@ -234,19 +251,19 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
         capacities = capacities - demands[jnp.arange(bs), next_nodes]
         capacities = jnp.where(next_nodes == 0, 1.0, capacities)
 
-        prev_node_embedding = node_embeddings[jnp.arange(bs), next_nodes]
-        step_context = jnp.concatenate(
-            [prev_node_embedding[:, None], capacities[:, None, None]], axis=-1
-        )
+        # prev_node_embedding = node_embeddings[jnp.arange(bs), next_nodes]
+        # step_context = jnp.concatenate(
+        #     [prev_node_embedding, capacities[:, None]], axis=-1
+        # )
 
         # Store the log-probability of the selected node (for training).
         step_log_probs = nn.log_softmax(logits, axis=-1)[jnp.arange(bs), next_nodes]
         log_probs = log_probs + step_log_probs
 
-        return (rng, sequences, visited, capacities, step_context, log_probs)
+        return (rng, sequences, visited, capacities, log_probs)
 
-    init = (rng, sequences, visited, capacities, step_context, log_probs)
-    _, sequences, _, _, _, log_probs = jax.lax.fori_loop(
+    init = (rng, sequences, visited, capacities, log_probs)
+    _, sequences, _, _, log_probs = jax.lax.fori_loop(
         1, 2 * seq_len, decode_iteration, init
     )
 

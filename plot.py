@@ -23,11 +23,11 @@ def test_parser():
         help="Weights/VRP***_train_epoch***.h5, h5 file required",
     )
     parser.add_argument(
-        "-b", "--batch", metavar="B", type=int, default=2, help="batch size"
+        "-b", "--batch_size", metavar="B", type=int, default=2, help="batch size"
     )
     parser.add_argument(
         "-n",
-        "--n_nodes",
+        "--num_nodes",
         metavar="N",
         type=int,
         default=20,
@@ -220,27 +220,28 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(0)
 
-    dataset = generate_data(n_samples=1, n_nodes=args.n_nodes, seed=args.seed)
-
-    x = (
-        jnp.zeros((args.batch, args.n_nodes, 2)),
-        jnp.zeros((args.batch, args.n_nodes)),
-    )
-    e = jnp.zeros((args.batch, args.n_nodes, args.embed_dim))
-    d = jnp.zeros((args.batch, args.embed_dim + 1))
-    m = jnp.zeros((args.batch, args.n_nodes, 1), dtype=np.bool)
+    dataset = generate_data(n_samples=1, n_nodes=args.num_nodes, seed=args.seed)
 
     model = AttentionModel(
         embed_dim=args.embed_dim,
     )
 
+    # Init values, used only to mimic the problem shapes.
+    coords = jnp.zeros((args.batch_size, args.num_nodes, 2))
+    demands = jnp.zeros((args.batch_size, args.num_nodes))
+    x = (coords, demands)
+    e = jnp.zeros((args.batch_size, args.num_nodes, model.embed_dim))
+    n = jnp.zeros(args.batch_size, dtype=jnp.int32)
+    c = jnp.zeros(args.batch_size)
+    m = jnp.zeros((args.batch_size, args.num_nodes, 1), dtype=np.bool)
+
     # Init weights.
     encoder_state, encoder_params = model.init(rng, x, method=model.encode).pop(
         "params"
     )
-    decoder_state, decoder_params = model.init(rng, e, d, m, method=model.decode).pop(
-        "params"
-    )
+    decoder_state, decoder_params = model.init(
+        rng, e, n, c, m, method=model.decode
+    ).pop("params")
 
     states = (encoder_state, decoder_state)
     params = (encoder_params, decoder_params)
@@ -253,7 +254,9 @@ if __name__ == "__main__":
 
     deterministic = args.decode_type == "greedy"
 
-    for i, data in dataset.repeat().batch(args.batch).enumerate().as_numpy_iterator():
+    for i, data in (
+        dataset.repeat().batch(args.batch_size).enumerate().as_numpy_iterator()
+    ):
 
         variables = (
             FrozenDict({"params": encoder_params, **encoder_state}),
@@ -272,7 +275,7 @@ if __name__ == "__main__":
         idx_in_batch = np.argmin(costs, axis=0)
         print("costs:", costs)
         print(
-            f"decode type:{args.decode_type}\nminimum cost: {costs[idx_in_batch]:.3f} and idx: {idx_in_batch} out of {args.batch} solutions"
+            f"decode type:{args.decode_type}\nminimum cost: {costs[idx_in_batch]:.3f} and idx: {idx_in_batch} out of {args.batch_size} solutions"
         )
         print(f"{np.array(pi)[idx_in_batch]}\ninference time: {time()-t1}s")
         plot_route(data, pi, costs, "Pretrained", idx_in_batch)
