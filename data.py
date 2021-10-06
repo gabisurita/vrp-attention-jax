@@ -1,5 +1,10 @@
 import tensorflow as tf
 
+# Disable GPUs and TPUs for TensorFlow, as we only use it
+# for data loading.
+tf.config.set_visible_devices([], "GPU")
+tf.config.set_visible_devices([], "TPU")
+
 
 def generate_data(n_samples=1000, n_nodes=20, seed=None, min_size=0.01, max_size=0.2):
     if seed is None:

@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 from functools import partial
+from typing import Callable, Tuple
 
 import flax.linen as nn
 import jax
@@ -6,51 +8,78 @@ import jax.numpy as jnp
 import numpy as np
 
 
-class EncoderLayer(nn.Module):
+class TransformerEncoderBlock(nn.Module):
     num_heads: int = 8
     embed_dim: int = 128
     ff_dim: int = 512
-    bn_epsilon: float = 1e-5
+    dropout_rate: float = 0.1
 
     def setup(self):
-
         self.mha = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.embed_dim,
             out_features=self.embed_dim,
+            dropout_rate=self.dropout_rate,
         )
 
         self.mlp1 = nn.Dense(self.ff_dim)
         self.mlp2 = nn.Dense(self.embed_dim)
+        # Kool et al. does not use dropout, but it usually helps.
+        self.dropout = nn.Dropout(self.dropout_rate)
 
-        self.bn1 = nn.BatchNorm(epsilon=self.bn_epsilon)
-        self.bn2 = nn.BatchNorm(epsilon=self.bn_epsilon)
+        # Paper uses BatchNorm instead of LayerNorm, but BatchNorm is usually
+        # unsuitable for variable length sequences.
+        # https://stats.stackexchange.com/questions/474440/
+        # TODO: consider ViT style normalization, with LayerNorm before MHA.
+        self.norm1 = nn.LayerNorm()
+        self.norm2 = nn.LayerNorm()
 
-    def __call__(self, x, mask=None, training=True):
+    def __call__(self, x, mask=None, deterministic=False):
         # Self attention
-        mha_out = self.mha(x, x, mask=mask, deterministic=not training)
-        bn1_out = self.bn1(x + mha_out, use_running_average=not training)
+        mha_out = self.mha(x, x, mask=mask, deterministic=deterministic)
+        mha_out = self.norm1(x + mha_out)
 
         # MLP
-        mlp_out = self.mlp1(bn1_out)
+        mlp_out = self.mlp1(mha_out)
         mlp_out = nn.relu(mlp_out)
+        mlp_out = self.dropout(mlp_out, deterministic=deterministic)
         mlp_out = self.mlp2(mlp_out)
-        bn2_out = self.bn2(x + mlp_out, use_running_average=not training)
+        out = self.norm2(mha_out + mlp_out)
 
-        return bn2_out
+        return out
 
 
-class GraphTransformerEncoder(nn.Module):
+class VRPNodeEmbedding(nn.Module):
+    embed_dim: int = 128
+
+    def setup(self):
+        self.encode_depot = nn.Dense(self.embed_dim)
+        self.encode_customers = nn.Dense(self.embed_dim)
+
+    def __call__(self, nodes):
+        coords, demands = nodes
+
+        return jnp.concatenate(
+            [
+                self.encode_depot(coords[:, :1, :]),
+                self.encode_customers(
+                    jnp.concatenate([coords[:, 1:, :], demands[:, 1:, None]], axis=-1)
+                ),
+            ],
+            axis=-2,
+        )
+
+
+class VRPEncoder(nn.Module):
     embed_dim: int = 128
     num_heads: int = 8
     num_layers: int = 3
     ff_dim: int = 512
 
     def setup(self):
-        self.encode_depot = nn.Dense(self.embed_dim)
-        self.encode_customers = nn.Dense(self.embed_dim)
-        self.encoder_layers = [
-            EncoderLayer(
+        self.embedding = VRPNodeEmbedding(self.embed_dim)
+        self.encoder_blocks = [
+            TransformerEncoderBlock(
                 num_heads=self.num_heads,
                 embed_dim=self.embed_dim,
                 ff_dim=self.ff_dim,
@@ -58,21 +87,11 @@ class GraphTransformerEncoder(nn.Module):
             for _ in range(self.num_layers)
         ]
 
-    def __call__(self, x, mask=None, training=True):
-        coords, demands = x
+    def __call__(self, nodes, mask=None, deterministic=False):
+        x = self.embedding(nodes)
 
-        x = jnp.concatenate(
-            [
-                self.encode_depot(coords[:, 0, None, :]),
-                self.encode_customers(
-                    jnp.concatenate([coords[:, 1:, :], demands[:, 1:, None]], axis=-1)
-                ),
-            ],
-            axis=1,
-        )
-
-        for layer in self.encoder_layers:
-            x = layer(x, mask=mask, training=training)
+        for block in self.encoder_blocks:
+            x = block(x, mask=mask, deterministic=deterministic)
 
         return x
 
@@ -96,7 +115,8 @@ class PointerDecoder(nn.Module):
             out_features=self.embed_dim,
         )
 
-    def __call__(self, node_embeddings, state_nodes, capacities, mask, training=True):
+    def __call__(self, node_embeddings, states, mask=None, deterministic=False):
+        state_nodes, capacities = states
         bs = node_embeddings.shape[0]
 
         # This part is a little different than the original paper. Instead of concatenating
@@ -109,11 +129,10 @@ class PointerDecoder(nn.Module):
         capacity_embedding = self.encode_capacity(capacities[:, None])
 
         Q1 = (state_node_embedding + graph_embedding + capacity_embedding)[:, None]
-
         Q2 = self.mha(
             Q1,
             node_embeddings,
-            mask=jnp.transpose(mask[:, None], (0, 1, 3, 2)),
+            mask=mask[:, None, None, :],
         )
 
         Q2 = self.Wq(Q2)
@@ -123,7 +142,7 @@ class PointerDecoder(nn.Module):
         logits = self.clip * nn.tanh(logits)
 
         logits = jnp.where(
-            jnp.transpose(mask, (0, 2, 1)),
+            mask[:, None, :],
             jnp.ones_like(logits) * -np.inf,
             logits,
         )
@@ -131,15 +150,16 @@ class PointerDecoder(nn.Module):
         return logits[:, 0]
 
 
-class AttentionModel(nn.Module):
+@dataclass(unsafe_hash=True)
+class AttentionModel:
     embed_dim: int = 128
     num_heads: int = 8
     num_layers: int = 3
     ff_dim: int = 512
     clip: float = 10.0
 
-    def setup(self):
-        self.encoder = GraphTransformerEncoder(
+    def __post_init__(self):
+        self.encoder = VRPEncoder(
             self.embed_dim,
             self.num_heads,
             self.num_layers,
@@ -151,33 +171,88 @@ class AttentionModel(nn.Module):
             self.clip,
         )
 
-    def encode(self, x, training=True):
-        return self.encoder(x, training=training)
+    def init(self, rng):
+        # Init values, used only to mimic the problem shapes.
+        b = 1
+        n = 1
+        coords = jnp.zeros((b, n, 2))
+        demands = jnp.zeros((b, n))
+        x = (coords, demands)
+        e = jnp.zeros((b, n, self.embed_dim))
+        s = jnp.zeros(b, dtype=jnp.int32)
+        c = jnp.zeros(b)
+        m = jnp.zeros((b, n), dtype=np.bool)
 
-    def decode(self, node_embeddings, state_nodes, capacities, mask, training=True):
-        return self.decoder(
-            node_embeddings, state_nodes, capacities, mask, training=training
+        encoder_variables = self.encoder.init({"params": rng, "dropout": rng}, x)
+        decoder_variables = self.decoder.init(
+            {"params": rng, "dropout": rng}, e, (s, c), m
         )
 
+        params = (encoder_variables["params"], decoder_variables["params"])
+        return params
 
-@partial(jax.jit, static_argnums=(0,), static_argnames=("deterministic", "training"))
-def solve(net, variables, rng, problems, deterministic=False, training=True):
+    @partial(jax.jit, static_argnums=(0,), static_argnames=("deterministic",))
+    def solve(self, params, rng, problems, deterministic=False):
+
+        encoder_params, decoder_params = params
+
+        def encode(rng, problems):
+            node_embeddings = self.encoder.apply(
+                {"params": encoder_params},
+                problems,
+                rngs={"dropout": rng},
+                deterministic=deterministic,
+            )
+            return node_embeddings
+
+        def decode(rng, encoded, states, mask):
+            logits = self.decoder.apply(
+                {"params": decoder_params},
+                encoded,
+                states,
+                mask,
+                deterministic=deterministic,
+                rngs={"dropout": rng},
+            )
+            return logits
+
+        routes, log_probs = decode_greedy(
+            encode,
+            decode,
+            rng,
+            problems,
+            deterministic=deterministic,
+        )
+
+        costs = get_costs(problems[0], routes)
+        return costs, log_probs, routes
+
+
+VRP = Tuple[jnp.ndarray, jnp.array]
+
+VRPEncoded = jnp.ndarray
+
+VRPDecoderState = Tuple[jnp.array, jnp.array]
+
+NodeMask = jnp.array
+
+EncoderFn = Callable[[jax.random.PRNGKey, VRP], VRPEncoded]
+
+DecoderFn = Callable[
+    [jax.random.PRNGKey, VRPEncoded, VRPDecoderState, NodeMask], jnp.array
+]
+
+
+@partial(jax.jit, static_argnums=(0, 1), static_argnames=("deterministic",))
+def decode_greedy(encoder, decoder, rng, problems, deterministic=False):
     coords, demands = problems
-
-    encoder_variables, decoder_variables = variables
 
     bs = coords.shape[0]
     seq_len = coords.shape[1]
 
-    encoder_state, _ = encoder_variables.pop("params")
-
-    node_embeddings, encoder_state = net.apply(
-        encoder_variables,
-        problems,
-        mutable=encoder_state.keys(),
-        method=net.encode,
-        training=training,
-    )
+    # Call encoder.
+    rng, encoder_rng = jax.random.split(rng)
+    encoded = encoder(encoder_rng, problems)
 
     # Create masks for each node type.
     customer_mask = jnp.ones((bs, seq_len), dtype=np.bool).at[:, 0].set(0)
@@ -193,10 +268,7 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
     # followed by a depot visit.
     sequences = jnp.zeros((bs, 2 * seq_len), dtype=jnp.int32)
 
-    # step_context = jnp.concatenate(
-    #     [node_embeddings[:, 0], capacities[:, None]], axis=-1
-    # )
-
+    # Store the sum of log probs.
     log_probs = jnp.zeros(bs)
 
     def decode_iteration(idx, loop_state):
@@ -221,18 +293,13 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
             ~(visited | ~customer_mask).all(axis=-1) & next_node_mask[:, 0],
         )
 
-        decoder_state, _ = decoder_variables.pop("params")
-
-        logits, decoder_state = net.apply(
-            decoder_variables,
-            node_embeddings,
-            current_node,
-            capacities,
-            # step_context,
-            next_node_mask[:, :, None],
-            mutable=decoder_state.keys(),
-            method=net.decode,
-            training=training,
+        # Call decoder.
+        rng, decoder_step_rng = jax.random.split(rng)
+        logits = decoder(
+            decoder_step_rng,
+            encoded,
+            (current_node, capacities),
+            next_node_mask,
         )
 
         if deterministic:
@@ -251,11 +318,6 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
         capacities = capacities - demands[jnp.arange(bs), next_nodes]
         capacities = jnp.where(next_nodes == 0, 1.0, capacities)
 
-        # prev_node_embedding = node_embeddings[jnp.arange(bs), next_nodes]
-        # step_context = jnp.concatenate(
-        #     [prev_node_embedding, capacities[:, None]], axis=-1
-        # )
-
         # Store the log-probability of the selected node (for training).
         step_log_probs = nn.log_softmax(logits, axis=-1)[jnp.arange(bs), next_nodes]
         log_probs = log_probs + step_log_probs
@@ -267,15 +329,7 @@ def solve(net, variables, rng, problems, deterministic=False, training=True):
         1, 2 * seq_len, decode_iteration, init
     )
 
-    # state = init
-    # for idx in range(1, max_len):
-    #     state = decode_iteration(idx, state)
-
-    # _, sequences, _, _, _, log_probs = state
-
-    cost = get_costs(coords, sequences)
-
-    return cost, log_probs, sequences
+    return sequences, log_probs
 
 
 def get_cost(coords, route):

@@ -3,13 +3,11 @@ import pickle
 from time import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
-from flax.core.frozen_dict import FrozenDict
 
 from data import generate_data
-from nn import AttentionModel, solve
+from nn import AttentionModel
 
 
 def test_parser():
@@ -226,31 +224,9 @@ if __name__ == "__main__":
         embed_dim=args.embed_dim,
     )
 
-    # Init values, used only to mimic the problem shapes.
-    coords = jnp.zeros((args.batch_size, args.num_nodes, 2))
-    demands = jnp.zeros((args.batch_size, args.num_nodes))
-    x = (coords, demands)
-    e = jnp.zeros((args.batch_size, args.num_nodes, model.embed_dim))
-    n = jnp.zeros(args.batch_size, dtype=jnp.int32)
-    c = jnp.zeros(args.batch_size)
-    m = jnp.zeros((args.batch_size, args.num_nodes, 1), dtype=np.bool)
-
-    # Init weights.
-    encoder_state, encoder_params = model.init(rng, x, method=model.encode).pop(
-        "params"
-    )
-    decoder_state, decoder_params = model.init(
-        rng, e, n, c, m, method=model.decode
-    ).pop("params")
-
-    states = (encoder_state, decoder_state)
-    params = (encoder_params, decoder_params)
-
     # If a checkpoint is passed, preload weights from it.
     with open(args.path, "rb") as f:
         params = pickle.load(f)
-
-    encoder_params, decoder_params = params
 
     deterministic = args.decode_type == "greedy"
 
@@ -258,20 +234,9 @@ if __name__ == "__main__":
         dataset.repeat().batch(args.batch_size).enumerate().as_numpy_iterator()
     ):
 
-        variables = (
-            FrozenDict({"params": encoder_params, **encoder_state}),
-            FrozenDict({"params": decoder_params, **decoder_state}),
+        costs, log_probs, pi = model.solve(
+            params, rng, data, deterministic=deterministic
         )
-
-        costs, log_probs, pi = solve(
-            model,
-            variables,
-            rng,
-            data,
-            deterministic=deterministic,
-            training=True,
-        )
-
         idx_in_batch = np.argmin(costs, axis=0)
         print("costs:", costs)
         print(
