@@ -1,4 +1,10 @@
+from functools import partial
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
 import tensorflow as tf
+from flax import struct
 
 # Disable GPUs and TPUs for TensorFlow, as we only use it
 # for data loading.
@@ -6,30 +12,59 @@ tf.config.set_visible_devices([], "GPU")
 tf.config.set_visible_devices([], "TPU")
 
 
-def generate_data(n_samples=1000, n_nodes=20, seed=None, min_size=0.01, max_size=0.2):
-    if seed is None:
-        g = tf.random.experimental.Generator.from_non_deterministic_state()
-    else:
-        g = tf.random.experimental.Generator.from_seed(seed)
+class VRP(NamedTuple):
+    mask: jnp.ndarray
+    coords: jnp.ndarray
+    demands: jnp.ndarray
 
-    @tf.function
-    def tf_rand():
-        return [
-            # Coords
-            g.uniform(shape=[n_samples, n_nodes, 2], minval=0, maxval=1),
-            # Demands
-            tf.concat(
-                [
-                    tf.zeros((n_samples, 1)),
-                    g.uniform(
-                        shape=[n_samples, n_nodes - 1],
-                        minval=min_size,
-                        maxval=max_size,
-                        dtype=tf.float32,
-                    ),
-                ],
-                axis=-1,
-            ),
-        ]
 
-    return tf.data.Dataset.from_tensor_slices(tuple(tf_rand()))
+@struct.dataclass
+class ProblemConfig:
+    num_samples: int = 512
+    min_customers: int = 40
+    max_customers: int = 60
+    min_demand: float = 0.01
+    max_demand: float = 0.2
+
+
+@partial(jax.jit, static_argnums=(0,))
+def create_batch(config, rng):
+    bs, n = config.num_samples, config.max_customers + 1
+
+    rng, size_rng = jax.random.split(rng)
+    sizes = jax.random.randint(
+        size_rng,
+        shape=(bs,),
+        minval=1 + config.min_customers,
+        maxval=config.max_customers,
+    )
+
+    mask = jnp.arange(n)[None, :] < sizes[:, None]
+
+    rng, coords_rng = jax.random.split(rng)
+    coords = jax.random.uniform(
+        coords_rng,
+        shape=(bs, n, 2),
+        minval=0.0,
+        maxval=1.0,
+    )
+
+    coords = jnp.where(mask[:, :, None], coords, 0.0)
+
+    rng, demands_rng = jax.random.split(rng)
+    demands = jax.random.uniform(
+        demands_rng,
+        shape=(bs, n),
+        minval=config.min_demand,
+        maxval=config.max_demand,
+    )
+
+    demands = jnp.where(mask, demands, 0.0).at[:, 0].set(0.0)
+
+    return VRP(mask, coords, demands)
+
+
+def create_dataset(config: ProblemConfig, rng: jax.random.PRNGKey) -> tf.data.Dataset:
+    """Create a tensorflow dataset of VRPs with the given config."""
+    batch = create_batch(config, rng)
+    return tf.data.Dataset.from_tensor_slices(batch)

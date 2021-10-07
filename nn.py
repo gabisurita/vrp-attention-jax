@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from data import VRP
+
 
 class TransformerEncoderBlock(nn.Module):
     num_heads: int = 8
@@ -24,13 +26,14 @@ class TransformerEncoderBlock(nn.Module):
 
         self.mlp1 = nn.Dense(self.ff_dim)
         self.mlp2 = nn.Dense(self.embed_dim)
-        # Kool et al. does not use dropout, but it usually helps.
+        # Kool et al. doesn't use dropout, but it usually helps.
         self.dropout = nn.Dropout(self.dropout_rate)
 
         # Paper uses BatchNorm instead of LayerNorm, but BatchNorm is usually
         # unsuitable for variable length sequences.
-        # https://stats.stackexchange.com/questions/474440/
+        # We go with the standard NLP LayerNorm style.
         # TODO: consider ViT style normalization, with LayerNorm before MHA.
+        # https://stats.stackexchange.com/questions/474440/
         self.norm1 = nn.LayerNorm()
         self.norm2 = nn.LayerNorm()
 
@@ -56,14 +59,15 @@ class VRPNodeEmbedding(nn.Module):
         self.encode_depot = nn.Dense(self.embed_dim)
         self.encode_customers = nn.Dense(self.embed_dim)
 
-    def __call__(self, nodes):
-        coords, demands = nodes
-
+    def __call__(self, vrp):
         return jnp.concatenate(
             [
-                self.encode_depot(coords[:, :1, :]),
+                self.encode_depot(vrp.coords[:, :1, :]),
                 self.encode_customers(
-                    jnp.concatenate([coords[:, 1:, :], demands[:, 1:, None]], axis=-1)
+                    jnp.concatenate(
+                        [vrp.coords[:, 1:, :], vrp.demands[:, 1:, None]],
+                        axis=-1,
+                    )
                 ),
             ],
             axis=-2,
@@ -87,8 +91,11 @@ class VRPEncoder(nn.Module):
             for _ in range(self.num_layers)
         ]
 
-    def __call__(self, nodes, mask=None, deterministic=False):
-        x = self.embedding(nodes)
+    def __call__(self, vrp, deterministic=False):
+        x = self.embedding(vrp)
+
+        # Build 3D attention mask from 2D self-attention mask.
+        mask = nn.make_attention_mask(vrp.mask > 0, vrp.mask > 0)
 
         for block in self.encoder_blocks:
             x = block(x, mask=mask, deterministic=deterministic)
@@ -175,15 +182,18 @@ class AttentionModel:
         # Init values, used only to mimic the problem shapes.
         b = 1
         n = 1
+
+        mask = jnp.zeros((b, n))
         coords = jnp.zeros((b, n, 2))
         demands = jnp.zeros((b, n))
-        x = (coords, demands)
+        vrp = VRP(mask, coords, demands)
+
         e = jnp.zeros((b, n, self.embed_dim))
         s = jnp.zeros(b, dtype=jnp.int32)
         c = jnp.zeros(b)
         m = jnp.zeros((b, n), dtype=np.bool)
 
-        encoder_variables = self.encoder.init({"params": rng, "dropout": rng}, x)
+        encoder_variables = self.encoder.init({"params": rng, "dropout": rng}, vrp)
         decoder_variables = self.decoder.init(
             {"params": rng, "dropout": rng}, e, (s, c), m
         )
@@ -224,11 +234,9 @@ class AttentionModel:
             deterministic=deterministic,
         )
 
-        costs = get_costs(problems[0], routes)
+        costs = get_costs(problems.coords, routes)
         return costs, log_probs, routes
 
-
-VRP = Tuple[jnp.ndarray, jnp.array]
 
 VRPEncoded = jnp.ndarray
 
@@ -244,18 +252,18 @@ DecoderFn = Callable[
 
 
 @partial(jax.jit, static_argnums=(0, 1), static_argnames=("deterministic",))
-def decode_greedy(encoder, decoder, rng, problems, deterministic=False):
-    coords, demands = problems
+def decode_greedy(encoder, decoder, rng, problem, deterministic=False):
 
-    bs = coords.shape[0]
-    seq_len = coords.shape[1]
+    bs = problem.coords.shape[0]
+    seq_len = problem.coords.shape[1]
 
     # Call encoder.
     rng, encoder_rng = jax.random.split(rng)
-    encoded = encoder(encoder_rng, problems)
+    encoded = encoder(encoder_rng, problem)
 
     # Create masks for each node type.
-    customer_mask = jnp.ones((bs, seq_len), dtype=np.bool).at[:, 0].set(0)
+    invalid_mask = problem.mask == False
+    customer_mask = problem.mask.at[:, 0].set(0)
 
     # Initialize visited mask with only the depot.
     visited = jnp.zeros((bs, seq_len), dtype=jnp.int32).at[:, 0].set(1)
@@ -278,10 +286,11 @@ def decode_greedy(encoder, decoder, rng, problems, deterministic=False):
 
         # Build the next node mask.
         next_node_mask = (
+            invalid_mask
             # We cannot visit already visited customers.
-            (visited & customer_mask)
+            | (visited & customer_mask)
             # We cannot visit nodes exceeding the vehicle capacity.
-            | (demands > capacities[:, None])
+            | (problem.demands > capacities[:, None])
         )
 
         # We disallow the vehicle to stay in the node.
@@ -315,7 +324,7 @@ def decode_greedy(encoder, decoder, rng, problems, deterministic=False):
 
         sequences = sequences.at[jnp.arange(bs), idx].set(next_nodes)
         visited = visited.at[jnp.arange(bs), next_nodes].set(1)
-        capacities = capacities - demands[jnp.arange(bs), next_nodes]
+        capacities = capacities - problem.demands[jnp.arange(bs), next_nodes]
         capacities = jnp.where(next_nodes == 0, 1.0, capacities)
 
         # Store the log-probability of the selected node (for training).

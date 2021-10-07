@@ -6,7 +6,7 @@ import jax
 import numpy as np
 import plotly.graph_objects as go
 
-from data import generate_data
+from data import ProblemConfig, create_dataset
 from nn import AttentionModel
 
 
@@ -21,7 +21,12 @@ def test_parser():
         help="Weights/VRP***_train_epoch***.h5, h5 file required",
     )
     parser.add_argument(
-        "-b", "--batch_size", metavar="B", type=int, default=2, help="batch size"
+        "-b",
+        "--batch_size",
+        metavar="B",
+        type=int,
+        default=2,
+        help="batch size",
     )
     parser.add_argument(
         "-n",
@@ -101,7 +106,8 @@ def plot_route(data, pi, costs, title, idx_in_batch=0):
     # Remove extra zeros
     pi_ = get_clean_path(pi[idx_in_batch])
 
-    coords, demands = data
+    coords = data.coords
+    demands = data.demands
 
     depot_xy = coords[idx_in_batch, 0]
     customer_xy = coords[idx_in_batch, 1:]
@@ -218,7 +224,7 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(0)
 
-    dataset = generate_data(n_samples=1, n_nodes=args.num_nodes, seed=args.seed)
+    dataset = create_dataset(ProblemConfig(), rng)
 
     model = AttentionModel(
         embed_dim=args.embed_dim,

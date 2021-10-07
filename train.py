@@ -1,5 +1,3 @@
-import copy
-import logging
 import pickle
 from dataclasses import dataclass
 from functools import partial
@@ -16,8 +14,8 @@ from scipy.stats import ttest_rel
 from simple_parsing import ArgumentParser
 from tqdm.auto import tqdm
 
-from data import generate_data
-from nn import AttentionModel, decode_greedy, get_costs
+from data import ProblemConfig, create_dataset
+from nn import AttentionModel
 
 # Disable GPUs and TPUs for TensorFlow, as we only use it
 # for data loading.
@@ -34,17 +32,20 @@ class TrainConfig:
     seed: int = 0
     """Random global seed."""
 
-    num_nodes: int = 100
-    """Number of nodes in the problem. Includes the depot."""
+    max_customers: int = 100
+    """Maximum number customers in the problem. Doesn't include the depot."""
 
-    num_samples: int = 128_000
+    min_customers: int = 100
+    """Minimum number customers in the problem. Doesn't include the depot."""
+
+    num_train_samples: int = 128_000
     """Number of training samples per epoch."""
 
     num_validation_samples: int = 10_000
     """Number of validation samples per epoch."""
 
-    batch_size: int = 256
-    """Training batch_size size."""
+    batch_size: int = 512
+    """Training batch size."""
 
     epochs: int = 1000
     """Number of training epochs."""
@@ -77,6 +78,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = args.train_config
+
+    dataset_config = ProblemConfig(
+        num_samples=cfg.num_train_samples,
+        min_customers=cfg.min_customers,
+        max_customers=cfg.max_customers,
+    )
+
+    eval_dataset_config = ProblemConfig(
+        num_samples=cfg.num_validation_samples,
+        min_customers=cfg.min_customers,
+        max_customers=cfg.max_customers,
+    )
+
     model = args.model
 
     # Setup experiment logging.
@@ -87,7 +101,13 @@ if __name__ == "__main__":
 
     # Initialize global RNG.
     rng = jax.random.PRNGKey(cfg.seed)
-    params = model.init(rng)
+
+    rng, train_data_rng = jax.random.split(rng)
+    rng, val_data_rng = jax.random.split(rng)
+    rng, params_rng = jax.random.split(rng)
+    rng, rollout_rng = jax.random.split(rng)
+
+    params = model.init(params_rng)
 
     # If a checkpoint is passed, preload weights from it.
     if cfg.load_path:
@@ -97,22 +117,44 @@ if __name__ == "__main__":
     baseline_params = params
 
     @jax.jit
-    def reinforce_with_rollout_loss(params, baseline_params, rng, problems):
-        costs, log_probs, _ = model.solve(params, rng, problems)
-        baseline, _, _ = model.solve(baseline_params, rng, problems, deterministic=True)
-        loss = jnp.mean((costs - baseline) * log_probs)
-        return loss, jnp.mean(costs)
+    def reinforce_step(rng, training_state, problems):
+        def loss_fn(params):
+            costs, log_probs, _ = model.solve(params, rng, problems)
+            baseline = jnp.mean(costs)
+            loss = jnp.mean((costs - baseline) * log_probs)
+            return loss, jnp.mean(costs)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, costs), grads = grad_fn(training_state.params)
+
+        training_state = training_state.apply_gradients(grads=grads)
+        return training_state, loss, costs
 
     @jax.jit
-    def reinforce_loss(params, _, rng, problems):
-        costs, log_probs, _ = model.solve(params, rng, problems)
-        baseline = jnp.mean(costs)
-        loss = jnp.mean((costs - baseline) * log_probs)
-        return loss, jnp.mean(costs)
+    def reinforce_with_rollout_step(rng, training_state, baseline_params, problems):
+        def loss_fn(params):
+            costs, log_probs, _ = model.solve(params, rng, problems)
+            baseline, _, _ = model.solve(
+                baseline_params, rng, problems, deterministic=True
+            )
+            loss = jnp.mean((costs - baseline) * log_probs)
+            return loss, jnp.mean(costs)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, costs), grads = grad_fn(training_state.params)
+
+        training_state = training_state.apply_gradients(grads=grads)
+        return training_state, loss, costs
+
+    @jax.jit
+    def eval_step(rng, params, problems):
+        costs, _, _ = model.solve(params, rng, problems, deterministic=True)
+        return costs
 
     optimizer = optax.chain(
-        optax.adam(learning_rate=cfg.learning_rate),
         optax.clip_by_global_norm(1.0),
+        # Use adam with weight decay as it sometimes leads to better generalization.
+        optax.adamw(learning_rate=cfg.learning_rate, weight_decay=1e-5),
     )
 
     training_state = TrainState.create(
@@ -120,60 +162,62 @@ if __name__ == "__main__":
     )
 
     # Sample a random evaluation dataset.
-    eval_dataset = generate_data(cfg.num_validation_samples, cfg.num_nodes)
+    val_data_rng, val_epoch_rng = jax.random.split(val_data_rng)
+    eval_dataset = create_dataset(eval_dataset_config, val_epoch_rng)
 
+    # Training loop.
     for epoch in range(cfg.epochs):
         # Sample the training data.
+        train_data_rng, train_epoch_rng = jax.random.split(train_data_rng)
         dataset = (
-            generate_data(cfg.num_samples, cfg.num_nodes)
+            create_dataset(dataset_config, train_epoch_rng)
             .batch(cfg.batch_size)
             .prefetch(tf.data.AUTOTUNE)
             .enumerate()
             .as_numpy_iterator()
         )
 
-        batches_per_epoch = int(np.ceil(cfg.num_samples / cfg.batch_size))
+        batches_per_epoch = int(np.ceil(cfg.num_train_samples / cfg.batch_size))
         pbar = tqdm(dataset, total=batches_per_epoch, disable=not cfg.use_tqdm)
 
         for t, inputs in pbar:
-            rng, step_rng = jax.random.split(rng)
+            rollout_rng, step_rng = jax.random.split(rollout_rng)
 
-            # Warmup mean baseline.
+            # Warmup.
             if cfg.load_path is None and epoch < cfg.warmup_epochs:
-                loss_fn = reinforce_loss
+                training_state, loss, costs = reinforce_step(
+                    step_rng, training_state, inputs
+                )
 
             # Greedy rollout baseline.
             else:
-                loss_fn = reinforce_with_rollout_loss
+                training_state, loss, costs = reinforce_with_rollout_step(
+                    step_rng, training_state, baseline_params, inputs
+                )
 
-            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-            (loss, costs), grads = grad_fn(
-                training_state.params, baseline_params, step_rng, inputs
-            )
-            training_state = training_state.apply_gradients(grads=grads)
+            step_metrics = {
+                "epoch": epoch,
+                "timestep": t,
+                "train_loss": float(loss),
+                "train_costs": float(costs),
+            }
+
+            pbar.set_postfix(loss=loss, costs=costs)
 
             if t % cfg.log_every == 0:
-                pbar.set_postfix(loss=loss, costs=costs)
-                mlflow.log_metrics(
-                    {
-                        "epoch": epoch,
-                        "timestep": t,
-                        "train_loss": float(loss),
-                        "train_costs": float(costs),
-                    }
-                )
+                mlflow.log_metrics(step_metrics)
 
         # Evaluate candidate.
         candidate_vals = jnp.concatenate(
             [
-                model.solve(training_state.params, rng, problems, deterministic=True)[0]
+                eval_step(rng, training_state.params, problems)
                 for problems in eval_dataset.batch(cfg.batch_size).as_numpy_iterator()
             ]
         )
 
         baseline_vals = jnp.concatenate(
             [
-                model.solve(baseline_params, rng, problems, deterministic=True)[0]
+                eval_step(rng, baseline_params, problems)
                 for problems in eval_dataset.batch(cfg.batch_size).as_numpy_iterator()
             ]
         )
@@ -203,7 +247,8 @@ if __name__ == "__main__":
         # If model is statiscally better than the baseline, copy model parameters.
         if candidate_better and statistically_significant:
             baseline_params = training_state.params
-            eval_dataset = generate_data(cfg.num_validation_samples, cfg.num_nodes)
+            val_data_rng, val_epoch_rng = jax.random.split(val_data_rng)
+            eval_dataset = create_dataset(eval_dataset_config, val_epoch_rng)
 
         # Save the model checkpoint.
         with open(f"{cfg.save_path}{cfg.task}_epoch{epoch}.pkl", "wb") as f:
