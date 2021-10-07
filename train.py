@@ -32,10 +32,10 @@ class TrainConfig:
     seed: int = 0
     """Random global seed."""
 
-    max_customers: int = 100
+    max_customers: int = 50
     """Maximum number customers in the problem. Doesn't include the depot."""
 
-    min_customers: int = 100
+    min_customers: int = 50
     """Minimum number customers in the problem. Doesn't include the depot."""
 
     num_train_samples: int = 128_000

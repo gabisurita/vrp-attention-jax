@@ -21,10 +21,11 @@ class VRP(NamedTuple):
 @struct.dataclass
 class ProblemConfig:
     num_samples: int = 512
-    min_customers: int = 40
-    max_customers: int = 60
-    min_demand: float = 0.01
-    max_demand: float = 0.2
+    min_customers: int = 50
+    max_customers: int = 50
+    min_demand: int = 1
+    max_demand: int = 9
+    capacity: int = 40
 
 
 @partial(jax.jit, static_argnums=(0,))
@@ -52,12 +53,12 @@ def create_batch(config, rng):
     coords = jnp.where(mask[:, :, None], coords, 0.0)
 
     rng, demands_rng = jax.random.split(rng)
-    demands = jax.random.uniform(
+    demands = jax.random.randint(
         demands_rng,
         shape=(bs, n),
         minval=config.min_demand,
         maxval=config.max_demand,
-    )
+    ) / jnp.array(config.capacity, dtype=jnp.float32)
 
     demands = jnp.where(mask, demands, 0.0).at[:, 0].set(0.0)
 
