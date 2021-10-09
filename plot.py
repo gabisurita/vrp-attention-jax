@@ -222,9 +222,17 @@ if __name__ == "__main__":
     args = test_parser()
     t1 = time()
 
-    rng = jax.random.PRNGKey(0)
+    rng = jax.random.PRNGKey(args.seed)
 
-    dataset = create_dataset(ProblemConfig(), rng)
+    dataset = create_dataset(
+        ProblemConfig(
+            min_customers=args.num_nodes,
+            max_customers=args.num_nodes,
+            capacity=50,
+            num_samples=1,
+        ),
+        rng,
+    )
 
     model = AttentionModel(
         embed_dim=args.embed_dim,
@@ -245,8 +253,9 @@ if __name__ == "__main__":
         )
         idx_in_batch = np.argmin(costs, axis=0)
         print("costs:", costs)
+        print(log_probs)
         print(
-            f"decode type:{args.decode_type}\nminimum cost: {costs[idx_in_batch]:.3f} and idx: {idx_in_batch} out of {args.batch_size} solutions"
+            f"deterministic: {deterministic}\nminimum cost: {costs[idx_in_batch]:.3f} and idx: {idx_in_batch} out of {args.batch_size} solutions"
         )
         print(f"{np.array(pi)[idx_in_batch]}\ninference time: {time()-t1}s")
         plot_route(data, pi, costs, "Pretrained", idx_in_batch)

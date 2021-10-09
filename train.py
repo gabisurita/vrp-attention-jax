@@ -44,6 +44,9 @@ class TrainConfig:
     num_validation_samples: int = 10_000
     """Number of validation samples per epoch."""
 
+    capacity: int = 50
+    """Capacity of the vehicle."""
+
     batch_size: int = 512
     """Training batch size."""
 
@@ -83,12 +86,14 @@ if __name__ == "__main__":
         num_samples=cfg.num_train_samples,
         min_customers=cfg.min_customers,
         max_customers=cfg.max_customers,
+        capacity=cfg.capacity,
     )
 
     eval_dataset_config = ProblemConfig(
         num_samples=cfg.num_validation_samples,
         min_customers=cfg.min_customers,
         max_customers=cfg.max_customers,
+        capacity=cfg.capacity,
     )
 
     model = args.model

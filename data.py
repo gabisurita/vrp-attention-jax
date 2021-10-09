@@ -24,7 +24,7 @@ class ProblemConfig:
     min_customers: int = 50
     max_customers: int = 50
     min_demand: int = 1
-    max_demand: int = 9
+    max_demand: int = 10
     capacity: int = 40
 
 
@@ -53,12 +53,15 @@ def create_batch(config, rng):
     coords = jnp.where(mask[:, :, None], coords, 0.0)
 
     rng, demands_rng = jax.random.split(rng)
-    demands = jax.random.randint(
-        demands_rng,
-        shape=(bs, n),
-        minval=config.min_demand,
-        maxval=config.max_demand,
-    ) / jnp.array(config.capacity, dtype=jnp.float32)
+    demands = (
+        jax.random.randint(
+            demands_rng,
+            shape=(bs, n),
+            minval=config.min_demand,
+            maxval=config.max_demand,
+        )
+        / jnp.array(config.capacity, dtype=jnp.float32)
+    )
 
     demands = jnp.where(mask, demands, 0.0).at[:, 0].set(0.0)
 
