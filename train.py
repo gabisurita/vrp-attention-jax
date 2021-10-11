@@ -1,6 +1,5 @@
 import pickle
 from dataclasses import dataclass
-from functools import partial
 from typing import Optional
 
 import jax
@@ -18,8 +17,7 @@ from tqdm.auto import tqdm
 from data import ProblemConfig, create_dataset
 from nn import AttentionModel
 
-# Disable GPUs and TPUs for TensorFlow, as we only use it
-# for data loading.
+# Disable GPUs and TPUs for TensorFlow, as we only use it for data loading.
 tf.config.set_visible_devices([], "GPU")
 tf.config.set_visible_devices([], "TPU")
 
@@ -73,6 +71,50 @@ class TrainConfig:
     """Frequency to log batch statistics."""
 
 
+@jax.jit
+def reinforce_step(state, rng, problems):
+    def loss_fn(params):
+        costs, log_probs, _ = state.apply_fn(params, rng, problems)
+        baseline = jnp.mean(costs)
+        loss = jnp.mean((costs - baseline) * log_probs)
+        return loss, jnp.mean(costs)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, costs), grads = grad_fn(state.params)
+
+    # Support gradient across devices.
+    grads = jax.lax.pmean(grads, "batch")
+
+    training_state = state.apply_gradients(grads=grads)
+    return training_state, loss, costs
+
+
+@jax.jit
+def reinforce_with_rollout_step(state, baseline_params, rng, problems):
+    def loss_fn(params):
+        costs, log_probs, _ = state.apply_fn(params, rng, problems)
+        baseline, _, _ = state.apply_fn(
+            baseline_params, rng, problems, deterministic=True
+        )
+        loss = jnp.mean((costs - baseline) * log_probs)
+        return loss, jnp.mean(costs)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss, costs), grads = grad_fn(state.params)
+
+    # Support gradient across devices.
+    grads = jax.lax.pmean(grads, "batch")
+
+    state = state.apply_gradients(grads=grads)
+    return state, loss, costs
+
+
+@jax.jit
+def eval_step(state, params, rng, problems):
+    costs, _, _ = state.apply_fn(params, rng, problems, deterministic=True)
+    return costs
+
+
 if __name__ == "__main__":
 
     # Load train config.
@@ -82,6 +124,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = args.train_config
+
+    devices = jax.devices()
+
+    assert cfg.num_train_samples % (
+        cfg.batch_size * len(devices)
+    ), "Invalid sample x batch x device shape"
 
     dataset_config = ProblemConfig(
         num_samples=cfg.num_train_samples,
@@ -98,8 +146,6 @@ if __name__ == "__main__":
     )
 
     model = args.model
-
-    devices = jax.devices()
 
     # Setup experiment logging.
     mlflow.set_experiment("/vrp-attention")
@@ -122,78 +168,20 @@ if __name__ == "__main__":
         with open(cfg.load_path, "rb") as f:
             params = pickle.load(f)
 
-    baseline_params = params
+    parallel_reinforce_step = jax.pmap(
+        reinforce_step,
+        axis_name="batch",
+    )
 
-    @jax.jit
-    def reinforce_step(rng, training_state, problems):
-        def loss_fn(params):
-            costs, log_probs, _ = model.solve(params, rng, problems)
-            baseline = jnp.mean(costs)
-            loss = jnp.mean((costs - baseline) * log_probs)
-            return loss, jnp.mean(costs)
+    parallel_reinforce_with_rollout_step = jax.pmap(
+        reinforce_with_rollout_step,
+        axis_name="batch",
+    )
 
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, costs), grads = grad_fn(training_state.params)
-
-        # Support gradient across devices.
-        grads = jax.lax.pmean(grads, "problems")
-
-        training_state = training_state.apply_gradients(grads=grads)
-        return training_state, loss, costs
-
-    @jax.jit
-    def reinforce_with_rollout_step(rng, training_state, baseline_params, problems):
-        def loss_fn(params):
-            costs, log_probs, _ = model.solve(params, rng, problems)
-            baseline, _, _ = model.solve(
-                baseline_params, rng, problems, deterministic=True
-            )
-            loss = jnp.mean((costs - baseline) * log_probs)
-            return loss, jnp.mean(costs)
-
-        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, costs), grads = grad_fn(training_state.params)
-
-        # Support gradient across devices.
-        grads = jax.lax.pmean(grads, "problems")
-
-        training_state = training_state.apply_gradients(grads=grads)
-        return training_state, loss, costs
-
-    @jax.jit
-    def parallel_reinforce_step(rng, training_state, problems):
-        rngs = jax.random.split(rng, len(devices))
-
-        states, loss, costs = jax.pmap(
-            reinforce_step,
-            axis_name="problems",
-            donate_argnums=(0, 1),
-        )(rngs, training_state, problems)
-
-        loss, costs = loss.mean(), costs.mean()
-
-        return states, loss, costs
-
-    @jax.jit
-    def parallel_reinforce_with_rollout_step(
-        rng, training_state, baseline_params, problems
-    ):
-        rngs = jax.random.split(rng, len(devices))
-
-        states, loss, costs = jax.pmap(
-            reinforce_with_rollout_step,
-            axis_name="problems",
-            donate_argnums=(0, 1, 2),
-        )(rngs, training_state, baseline_params, problems)
-
-        loss, costs = loss.mean(), costs.mean()
-
-        return states, loss, costs
-
-    @jax.jit
-    def eval_step(rng, params, problems):
-        costs, _, _ = model.solve(params, rng, problems, deterministic=True)
-        return costs
+    parallel_eval_step = jax.pmap(
+        eval_step,
+        axis_name="batch",
+    )
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -201,9 +189,14 @@ if __name__ == "__main__":
         optax.adamw(learning_rate=cfg.learning_rate, weight_decay=1e-5),
     )
 
-    training_state = TrainState.create(
-        apply_fn=model.solve, params=params, tx=optimizer
-    )
+    # Create the training state with the model.solve funtion.
+    state = TrainState.create(apply_fn=model.solve, params=params, tx=optimizer)
+
+    # Replicate state across devices.
+    state = flax.jax_utils.replicate(state)
+
+    # Copy params to the baseline model.
+    baseline_params = state.params
 
     # Sample a random evaluation dataset.
     val_data_rng, val_epoch_rng = jax.random.split(val_data_rng)
@@ -212,41 +205,37 @@ if __name__ == "__main__":
     # Training loop.
     for epoch in range(cfg.epochs):
 
-        parallel_baseline = flax.jax_utils.replicate(baseline_params)
-        parallel_training_state = flax.jax_utils.replicate(training_state)
-
         # Sample the training data.
         train_data_rng, train_epoch_rng = jax.random.split(train_data_rng)
-        dataset = (
+        train_dataset = (
             create_dataset(dataset_config, train_epoch_rng)
             .batch(cfg.batch_size // len(devices))
-            .batch(len(devices), drop_remainder=True)
+            .batch(len(devices))
             .prefetch(tf.data.AUTOTUNE)
             .enumerate()
             .as_numpy_iterator()
         )
 
         batches_per_epoch = int(np.ceil(cfg.num_train_samples // cfg.batch_size))
-        pbar = tqdm(dataset, total=batches_per_epoch, disable=not cfg.use_tqdm)
+        pbar = tqdm(train_dataset, total=batches_per_epoch, disable=not cfg.use_tqdm)
 
         for t, inputs in pbar:
             rollout_rng, step_rng = jax.random.split(rollout_rng)
 
+            device_rngs = jax.random.split(rng, len(devices))
+
             # Warmup.
             if cfg.load_path is None and epoch < cfg.warmup_epochs:
-                parallel_training_state, loss, costs = parallel_reinforce_step(
-                    step_rng, parallel_training_state, inputs
-                )
+                state, loss, costs = parallel_reinforce_step(state, device_rngs, inputs)
 
             # Greedy rollout baseline.
             else:
-                (
-                    parallel_training_state,
-                    loss,
-                    costs,
-                ) = parallel_reinforce_with_rollout_step(
-                    step_rng, parallel_training_state, parallel_baseline, inputs
+                state, loss, costs = parallel_reinforce_with_rollout_step(
+                    state, baseline_params, device_rngs, inputs
                 )
+
+            # Means across devices.
+            loss, costs = loss.mean(), costs.mean()
 
             step_metrics = {
                 "epoch": epoch,
@@ -260,22 +249,28 @@ if __name__ == "__main__":
             if t % cfg.log_every == 0:
                 mlflow.log_metrics(step_metrics)
 
-        training_state = flax.jax_utils.unreplicate(parallel_training_state)
+        candidate_vals = jnp.empty((0,))
+        baseline_vals = jnp.empty((0,))
 
-        # Evaluate candidate.
-        candidate_vals = jnp.concatenate(
-            [
-                eval_step(rng, training_state.params, problems)
-                for problems in eval_dataset.batch(cfg.batch_size).as_numpy_iterator()
-            ]
-        )
+        # Evaluation dataset.
+        for problems in (
+            eval_dataset.batch(cfg.batch_size).batch(len(devices)).as_numpy_iterator()
+        ):
+            device_rngs = jax.random.split(rng, len(devices))
 
-        baseline_vals = jnp.concatenate(
-            [
-                eval_step(rng, baseline_params, problems)
-                for problems in eval_dataset.batch(cfg.batch_size).as_numpy_iterator()
-            ]
-        )
+            step_candidate_vals = parallel_eval_step(
+                state, state.params, device_rngs, problems
+            )
+            step_baseline_vals = parallel_eval_step(
+                state, baseline_params, device_rngs, problems
+            )
+
+            candidate_vals = jnp.concatenate(
+                [candidate_vals, step_candidate_vals.flatten()]
+            )
+            baseline_vals = jnp.concatenate(
+                [baseline_vals, step_baseline_vals.flatten()]
+            )
 
         candidate_mean = jnp.mean(candidate_vals)
         baseline_mean = jnp.mean(baseline_vals)
@@ -301,10 +296,13 @@ if __name__ == "__main__":
 
         # If model is statiscally better than the baseline, copy model parameters.
         if candidate_better and statistically_significant:
-            baseline_params = training_state.params
+
+            baseline_params = state.params
             val_data_rng, val_epoch_rng = jax.random.split(val_data_rng)
             eval_dataset = create_dataset(eval_dataset_config, val_epoch_rng)
 
         # Save the model checkpoint.
+        params = flax.jax_utils.unreplicate(state).params
+
         with open(f"{cfg.save_path}{cfg.task}_epoch{epoch}.pkl", "wb") as f:
-            pickle.dump(training_state.params, f)
+            pickle.dump(params, f)
