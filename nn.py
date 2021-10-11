@@ -135,11 +135,13 @@ class PointerDecoder(nn.Module):
         graph_embedding = self.encode_graph(jnp.sum(node_embeddings, axis=1))
         capacity_embedding = self.encode_capacity(capacities[:, None])
 
+        attention_mask = nn.make_attention_mask(np.ones((bs, 1), dtype=jnp.int32), mask == 0)
+
         Q1 = (state_node_embedding + graph_embedding + capacity_embedding)[:, None]
         Q2 = self.mha(
             Q1,
             node_embeddings,
-            mask=mask[:, None, None, :],
+            mask=attention_mask,
         )
 
         Q2 = self.Wq(Q2)
