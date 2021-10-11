@@ -9,6 +9,7 @@ import mlflow
 import numpy as np
 import optax
 import tensorflow as tf
+import flax
 from flax.training.train_state import TrainState
 from scipy.stats import ttest_rel
 from simple_parsing import ArgumentParser
@@ -98,6 +99,8 @@ if __name__ == "__main__":
 
     model = args.model
 
+    devices = jax.devices()
+
     # Setup experiment logging.
     mlflow.set_experiment("/vrp-attention")
     mlflow.start_run()
@@ -132,6 +135,9 @@ if __name__ == "__main__":
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, costs), grads = grad_fn(training_state.params)
 
+        # Support gradient across devices.
+        grads = jax.lax.pmean(grads, "problems")
+
         training_state = training_state.apply_gradients(grads=grads)
         return training_state, loss, costs
 
@@ -148,8 +154,41 @@ if __name__ == "__main__":
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, costs), grads = grad_fn(training_state.params)
 
+        # Support gradient across devices.
+        grads = jax.lax.pmean(grads, "problems")
+
         training_state = training_state.apply_gradients(grads=grads)
         return training_state, loss, costs
+
+    @jax.jit
+    def parallel_reinforce_step(rng, training_state, problems):
+        rngs = jax.random.split(rng, len(devices))
+
+        states, loss, costs = jax.pmap(
+            reinforce_step,
+            axis_name="problems",
+            donate_argnums=(0, 1),
+        )(rngs, training_state, problems)
+
+        loss, costs = loss.mean(), costs.mean()
+
+        return states, loss, costs
+
+    @jax.jit
+    def parallel_reinforce_with_rollout_step(
+        rng, training_state, baseline_params, problems
+    ):
+        rngs = jax.random.split(rng, len(devices))
+
+        states, loss, costs = jax.pmap(
+            reinforce_with_rollout_step,
+            axis_name="problems",
+            donate_argnums=(0, 1, 2),
+        )(rngs, training_state, baseline_params, problems)
+
+        loss, costs = loss.mean(), costs.mean()
+
+        return states, loss, costs
 
     @jax.jit
     def eval_step(rng, params, problems):
@@ -172,17 +211,22 @@ if __name__ == "__main__":
 
     # Training loop.
     for epoch in range(cfg.epochs):
+
+        parallel_baseline = flax.jax_utils.replicate(baseline_params)
+        parallel_training_state = flax.jax_utils.replicate(training_state)
+
         # Sample the training data.
         train_data_rng, train_epoch_rng = jax.random.split(train_data_rng)
         dataset = (
             create_dataset(dataset_config, train_epoch_rng)
-            .batch(cfg.batch_size)
+            .batch(cfg.batch_size // len(devices))
+            .batch(len(devices), drop_remainder=True)
             .prefetch(tf.data.AUTOTUNE)
             .enumerate()
             .as_numpy_iterator()
         )
 
-        batches_per_epoch = int(np.ceil(cfg.num_train_samples / cfg.batch_size))
+        batches_per_epoch = int(np.ceil(cfg.num_train_samples // cfg.batch_size))
         pbar = tqdm(dataset, total=batches_per_epoch, disable=not cfg.use_tqdm)
 
         for t, inputs in pbar:
@@ -190,14 +234,18 @@ if __name__ == "__main__":
 
             # Warmup.
             if cfg.load_path is None and epoch < cfg.warmup_epochs:
-                training_state, loss, costs = reinforce_step(
-                    step_rng, training_state, inputs
+                parallel_training_state, loss, costs = parallel_reinforce_step(
+                    step_rng, parallel_training_state, inputs
                 )
 
             # Greedy rollout baseline.
             else:
-                training_state, loss, costs = reinforce_with_rollout_step(
-                    step_rng, training_state, baseline_params, inputs
+                (
+                    parallel_training_state,
+                    loss,
+                    costs,
+                ) = parallel_reinforce_with_rollout_step(
+                    step_rng, parallel_training_state, parallel_baseline, inputs
                 )
 
             step_metrics = {
@@ -211,6 +259,8 @@ if __name__ == "__main__":
 
             if t % cfg.log_every == 0:
                 mlflow.log_metrics(step_metrics)
+
+        training_state = flax.jax_utils.unreplicate(parallel_training_state)
 
         # Evaluate candidate.
         candidate_vals = jnp.concatenate(
