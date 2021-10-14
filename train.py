@@ -4,6 +4,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import jax.tools.colab_tpu
 import mlflow
 import numpy as np
 import optax
@@ -43,7 +44,7 @@ class TrainConfig:
     num_validation_samples: int = 10_000
     """Number of validation samples per epoch."""
 
-    capacity: int = 50
+    capacity: int = 40
     """Capacity of the vehicle."""
 
     batch_size: int = 512
@@ -57,6 +58,12 @@ class TrainConfig:
 
     learning_rate: float = 1e-4
     """Adam learning rate."""
+
+    gradient_clipping: float = 1.0
+    """Global gradient clipping."""
+
+    weight_decay: float = 1e-3
+    """AdamW weight decay."""
 
     save_path: str = "./weights/"
     """Path to save model checkpoints."""
@@ -117,6 +124,13 @@ def eval_step(state, params, rng, problems):
 
 if __name__ == "__main__":
 
+    # Setup colab TPUs, or just ignore.
+    try:
+        jax.tools.colab_tpu.setup_tpu()
+    except KeyError:
+        print(f"Failed to setup TPUs, COLAB_TPU_ADDR not set.")
+        pass
+
     # Load train config.
     parser = ArgumentParser()
     parser.add_arguments(TrainConfig, dest="train_config")
@@ -127,9 +141,11 @@ if __name__ == "__main__":
 
     devices = jax.devices()
 
-    assert cfg.num_train_samples % (
-        cfg.batch_size * len(devices)
-    ), "Invalid sample x batch x device shape"
+    print(devices)
+
+    # assert cfg.num_train_samples % (
+    #     cfg.batch_size * len(devices)
+    # ), "Invalid sample x batch x device shape"
 
     dataset_config = ProblemConfig(
         num_samples=cfg.num_train_samples,
@@ -184,9 +200,9 @@ if __name__ == "__main__":
     )
 
     optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
+        optax.clip_by_global_norm(cfg.gradient_clipping),
         # Use adam with weight decay as it sometimes leads to better generalization.
-        optax.adamw(learning_rate=cfg.learning_rate, weight_decay=1e-5),
+        optax.adamw(learning_rate=cfg.learning_rate, weight_decay=cfg.weight_decay),
     )
 
     # Create the training state with the model.solve funtion.
@@ -254,7 +270,7 @@ if __name__ == "__main__":
 
         # Evaluation dataset.
         for problems in (
-            eval_dataset.batch(cfg.batch_size).batch(len(devices)).as_numpy_iterator()
+            eval_dataset.batch(cfg.batch_size // len(devices)).batch(len(devices)).as_numpy_iterator()
         ):
             device_rngs = jax.random.split(rng, len(devices))
 
