@@ -1,7 +1,7 @@
 JAX + Attention Learn To Solve Routing Problems
 ===============================================
 
-Reinplementation of the paper 
+Reimplementation of the paper 
 [Attention, Learn to Solve Routing Problems!](https://arxiv.org/abs/1803.08475) using
 [Jax](https://github.com/google/jax) and [Flax](https://github.com/google/flax).
 Fully suitable for multiple GPU and TPU execution.

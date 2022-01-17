@@ -230,34 +230,38 @@ class AttentionModel:
             )
             return logits
 
-        # if deterministic:
+        if deterministic:
 
-        #     routes, log_probs = jax.vmap(partial(
-        #         decode_beam_search,
-        #         encode,
-        #         decode,
-        #         rng,
-        #         deterministic=deterministic,
-        #     ))(problem=problems)
+            routes, log_probs = jax.vmap(
+                partial(
+                    decode_beam_search,
+                    encode,
+                    decode,
+                    rng,
+                    deterministic=deterministic,
+                )
+            )(problem=problems)
 
-        #     cost_beams = lambda problem, routes: jax.vmap(partial(get_cost, problem))(routes)
-        #     costs = jax.vmap(cost_beams)(problems.coords, routes)
+            cost_beams = lambda problem, routes: jax.vmap(partial(get_cost, problem))(
+                routes
+            )
+            costs = jax.vmap(cost_beams)(problems.coords, routes)
 
-        #     best = costs.argmin(axis=-1)
-        #     bs = routes.shape[0]
-        #     costs = costs[jnp.arange(bs), best]
-        #     routes = routes[jnp.arange(bs), best]
-        #     log_probs = log_probs[jnp.arange(bs), best]
+            best = costs.argmin(axis=-1)
+            bs = routes.shape[0]
+            costs = costs[jnp.arange(bs), best]
+            routes = routes[jnp.arange(bs), best]
+            log_probs = log_probs[jnp.arange(bs), best]
 
-        # else:
-        routes, log_probs = decode_greedy(
-            encode,
-            decode,
-            rng,
-            problems,
-            deterministic=deterministic,
-        )
-        costs = get_costs(problems.coords, routes)
+        else:
+            routes, log_probs = decode_greedy(
+                encode,
+                decode,
+                rng,
+                problems,
+                deterministic=deterministic,
+            )
+            costs = get_costs(problems.coords, routes)
 
         return costs, log_probs, routes
 
@@ -367,7 +371,7 @@ def decode_greedy(encoder, decoder, rng, problem, deterministic=False):
 
 @partial(jax.jit, static_argnums=(0, 1), static_argnames=("deterministic", "num_beams"))
 def decode_beam_search(
-    encoder, decoder, rng, problem, deterministic=False, num_beams=20
+    encoder, decoder, rng, problem, deterministic=False, num_beams=4
 ):
 
     max_nodes = problem.coords.shape[-2]
@@ -449,6 +453,10 @@ def decode_beam_search(
         transition_log_probs = sequence_log_probs[:, None] + log_probs
 
         # Compute top k transitions over the flattened array.
+        # if not deterministic:
+        #     rng, sample_rng = jax.random.split(rng)
+        #     transition_log_probs -= jax.random.uniform(sample_rng, shape=transition_log_probs.shape, minval=0.0, maxval=0.1)
+
         values, indices = jax.lax.top_k(transition_log_probs.flatten(), num_beams)
 
         # Retrive beam indexes and node indexes from the flattened array.

@@ -270,7 +270,9 @@ if __name__ == "__main__":
 
         # Evaluation dataset.
         for problems in (
-            eval_dataset.batch(cfg.batch_size // len(devices)).batch(len(devices)).as_numpy_iterator()
+            eval_dataset.batch(cfg.batch_size // len(devices))
+            .batch(len(devices))
+            .as_numpy_iterator()
         ):
             device_rngs = jax.random.split(rng, len(devices))
 
