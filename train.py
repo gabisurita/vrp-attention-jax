@@ -32,10 +32,10 @@ class TrainConfig:
     seed: int = 0
     """Random global seed."""
 
-    max_customers: int = 50
+    max_customers: int = 100
     """Maximum number customers in the problem. Doesn't include the depot."""
 
-    min_customers: int = 50
+    min_customers: int = 100
     """Minimum number customers in the problem. Doesn't include the depot."""
 
     num_train_samples: int = 128_000
@@ -62,7 +62,7 @@ class TrainConfig:
     gradient_clipping: float = 1.0
     """Global gradient clipping."""
 
-    weight_decay: float = 1e-3
+    weight_decay: float = 0.0
     """AdamW weight decay."""
 
     save_path: str = "./weights/"
@@ -226,7 +226,7 @@ if __name__ == "__main__":
         train_dataset = (
             create_dataset(dataset_config, train_epoch_rng)
             .batch(cfg.batch_size // len(devices))
-            .batch(len(devices))
+            .batch(len(devices), drop_remainder=True)
             .prefetch(tf.data.AUTOTUNE)
             .enumerate()
             .as_numpy_iterator()
@@ -271,7 +271,7 @@ if __name__ == "__main__":
         # Evaluation dataset.
         for problems in (
             eval_dataset.batch(cfg.batch_size // len(devices))
-            .batch(len(devices))
+            .batch(len(devices), drop_remainder=True)
             .as_numpy_iterator()
         ):
             device_rngs = jax.random.split(rng, len(devices))
